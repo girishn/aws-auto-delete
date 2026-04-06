@@ -22,8 +22,10 @@ resource "aws_lambda_function" "cleanup" {
   handler          = "lambda_cleanup.handler"
   runtime          = "python3.12"
   role             = aws_iam_role.cleanup_lambda.arn
-  timeout          = 300   # 5 minutes
-  memory_size      = 128   # minimum — this job is I/O bound, not CPU bound
+  # Multi-region discovery + many sequential deletes can exceed a few minutes.
+  # Lambda max is 900s; raise this if you still hit timeouts (then consider Step Functions or fan-out).
+  timeout          = 900
+  memory_size      = 128   # I/O bound; increase if you add parallel workers in code
 
   environment {
     variables = {

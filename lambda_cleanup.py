@@ -143,7 +143,8 @@ def delete_ec2(session, arn: str):
         ec2.delete_internet_gateway(InternetGatewayId=rid)
         logger.info(f"Deleted internet gateway: {rid}")
 
-    elif rtype == "elastic-ip":
+    elif rtype in ("elastic-ip", "address"):
+        # Tagging API / IAM docs use elastic-ip; some ARN formats use address — same resource.
         resp = ec2.describe_addresses(AllocationIds=[rid])
         addrs = resp.get("Addresses", [])
         if not addrs:
@@ -1088,6 +1089,7 @@ def sort_arns_for_deletion(arns: list[str]) -> list[str]:
                 "natgateway": 0,
                 "internet-gateway": 1,
                 "elastic-ip": 2,
+                "address": 2,
                 "vpc-endpoint": 3,
             }
             return (4, order.get(r, 50), a)
