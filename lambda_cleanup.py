@@ -5,8 +5,9 @@ Finds all resources tagged with auto-delete=true and deletes them.
 Triggered by EventBridge Scheduler (e.g. cron at 8pm UTC nightly).
 
 Supported resource types:
-  - EC2 instances, key pairs, security groups, EBS volumes, snapshots, AMIs
-  - RDS instances, clusters & Aurora clusters
+  - EC2 instances, key pairs, security groups, EBS volumes, snapshots, AMIs,
+    NAT gateways, internet gateways, Elastic IPs, VPC interface endpoints
+  - RDS instances, clusters & Aurora clusters, RDS Proxy
   - ECS clusters & services
   - ELBv2 load balancers & target groups
   - Lambda functions
@@ -19,10 +20,20 @@ Supported resource types:
   - AWS App Runner  — services & VPC connectors
   - Amazon SageMaker — endpoints, endpoint configs, models, notebook instances,
                        pipelines, domains, feature groups, training/processing jobs
+  - Billable “running” infrastructure — EKS, ElastiCache, EFS, Redshift &
+    Redshift Serverless, MemoryDB, MSK, Kinesis & Firehose, Step Functions,
+    EventBridge rules, ECR repos, Secrets Manager secrets, Glue crawlers/jobs,
+    EMR clusters, Amplify apps, MQ brokers, DMS replication instances, Batch
+    compute environments, API Gateway (REST v1 / HTTP+WS v2), AppSync APIs,
+    CloudWatch Logs groups, DocumentDB Elastic, Timestream databases,
+    Global Accelerator accelerators
 """
 
-import boto3
 import logging
+import os
+import time
+
+import boto3
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
@@ -35,14 +46,25 @@ TAG_VALUE = "true"
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def get_all_tagged_resources(session):
-    """Return every resource ARN tagged auto-delete=true in this region."""
-    client = session.client("resourcegroupstaggingapi")
+    """Return every resource ARN tagged auto-delete=true across all regions."""
+    ec2 = session.client("ec2")
+    try:
+        regions = [r["RegionName"] for r in ec2.describe_regions()["Regions"]]
+    except ClientError as e:
+        logger.error(f"Could not list regions, falling back to Lambda region: {e}")
+        regions = [session.region_name or "us-east-1"]
+
     arns = []
-    paginator = client.get_paginator("get_resources")
-    for page in paginator.paginate(
-        TagFilters=[{"Key": TAG_KEY, "Values": [TAG_VALUE]}]
-    ):
-        arns.extend(r["ResourceARN"] for r in page["ResourceTagMappingList"])
+    for region in regions:
+        try:
+            client = session.client("resourcegroupstaggingapi", region_name=region)
+            paginator = client.get_paginator("get_resources")
+            for page in paginator.paginate(
+                TagFilters=[{"Key": TAG_KEY, "Values": [TAG_VALUE]}]
+            ):
+                arns.extend(r["ResourceARN"] for r in page["ResourceTagMappingList"])
+        except ClientError as e:
+            logger.warning(f"Tagging API in {region} failed (skipping): {e}")
     return arns
 
 
@@ -60,6 +82,14 @@ def resource_type_of(arn: str) -> str:
         resource = parts[5]          # e.g. "instance/i-0abc123"
         return resource.split("/")[0]
     return ""
+
+
+def region_of(arn: str) -> str | None:
+    """Region segment of a regional ARN; None for global ARNs (e.g. S3, IAM)."""
+    parts = arn.split(":")
+    if len(parts) > 3 and parts[3]:
+        return parts[3]
+    return None
 
 
 # ── Per-service deletors ──────────────────────────────────────────────────────
@@ -92,6 +122,43 @@ def delete_ec2(session, arn: str):
     elif rtype == "key-pair":
         ec2.delete_key_pair(KeyPairId=rid)
         logger.info(f"Deleted key pair: {rid}")
+
+    elif rtype == "natgateway":
+        ec2.delete_nat_gateway(NatGatewayId=rid)
+        logger.info(f"Deleted NAT gateway: {rid}")
+
+    elif rtype == "internet-gateway":
+        resp = ec2.describe_internet_gateways(InternetGatewayIds=[rid])
+        igws = resp.get("InternetGateways", [])
+        if not igws:
+            logger.warning(f"Internet gateway {rid} not found — skipping")
+            return
+        for att in igws[0].get("Attachments", []):
+            vpc_id = att.get("VpcId")
+            if vpc_id:
+                ec2.detach_internet_gateway(
+                    InternetGatewayId=rid, VpcId=vpc_id
+                )
+                logger.info(f"Detached internet gateway {rid} from VPC {vpc_id}")
+        ec2.delete_internet_gateway(InternetGatewayId=rid)
+        logger.info(f"Deleted internet gateway: {rid}")
+
+    elif rtype == "elastic-ip":
+        resp = ec2.describe_addresses(AllocationIds=[rid])
+        addrs = resp.get("Addresses", [])
+        if not addrs:
+            logger.warning(f"Elastic IP {rid} not found — skipping")
+            return
+        assoc = addrs[0].get("AssociationId")
+        if assoc:
+            ec2.disassociate_address(AssociationId=assoc)
+            logger.info(f"Disassociated Elastic IP {rid} before release")
+        ec2.release_address(AllocationId=rid)
+        logger.info(f"Released Elastic IP: {rid}")
+
+    elif rtype == "vpc-endpoint":
+        ec2.delete_vpc_endpoints(VpcEndpointIds=[rid])
+        logger.info(f"Deleted VPC endpoint: {rid}")
 
     else:
         logger.warning(f"Unknown EC2 resource type '{rtype}' — skipping {arn}")
@@ -137,6 +204,10 @@ def delete_rds(session, arn: str):
     elif rtype == "snapshot":
         rds.delete_db_snapshot(DBSnapshotIdentifier=rid)
         logger.info(f"Deleted RDS snapshot: {rid}")
+
+    elif rtype == "db-proxy":
+        rds.delete_db_proxy(DBProxyName=rid)
+        logger.info(f"Deleted RDS Proxy: {rid}")
 
     else:
         logger.warning(f"Unknown RDS resource type '{rtype}' — skipping {arn}")
@@ -187,7 +258,6 @@ def delete_elasticloadbalancing(session, arn: str):
 def delete_lambda_fn(session, arn: str):
     fn_name = arn.split(":")[-1]
     # Don't delete ourselves!
-    import os
     if fn_name == os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
         logger.warning("Skipping self-deletion of this Lambda function.")
         return
@@ -612,6 +682,420 @@ def delete_opensearch_ingestion(session, arn: str):
         )
 
 
+def _wait_efs_mount_targets_gone(efs_client, fs_id: str, max_wait: int = 120) -> None:
+    """Mount targets must finish deleting before DeleteFileSystem succeeds."""
+    deadline = time.monotonic() + max_wait
+    while time.monotonic() < deadline:
+        mts = efs_client.describe_mount_targets(FileSystemId=fs_id).get("MountTargets", [])
+        if not mts:
+            return
+        time.sleep(2)
+    raise TimeoutError(f"EFS mount targets for {fs_id} still present after {max_wait}s")
+
+
+def delete_eks(session, arn: str):
+    """EKS clusters, node groups, and Fargate profiles (hourly control-plane + worker $)."""
+    eks = session.client("eks")
+    rtype = resource_type_of(arn)
+    parts = arn.split("/")
+
+    if rtype == "cluster":
+        name = parts[-1]
+        for ng in eks.list_nodegroups(clusterName=name).get("nodegroups", []):
+            eks.delete_nodegroup(clusterName=name, nodegroupName=ng)
+            logger.info(f"Deleting EKS node group: {ng}")
+        for fp in eks.list_fargate_profiles(clusterName=name).get("fargateProfileNames", []):
+            eks.delete_fargate_profile(clusterName=name, fargateProfileName=fp)
+            logger.info(f"Deleting EKS Fargate profile: {fp}")
+        eks.delete_cluster(name=name)
+        logger.info(f"Deleted EKS cluster: {name}")
+
+    elif rtype == "nodegroup":
+        eks.delete_nodegroup(clusterName=parts[-2], nodegroupName=parts[-1])
+        logger.info(f"Deleted EKS node group: {parts[-1]}")
+
+    elif rtype == "fargateprofile":
+        eks.delete_fargate_profile(clusterName=parts[-2], fargateProfileName=parts[-1])
+        logger.info(f"Deleted EKS Fargate profile: {parts[-1]}")
+
+    else:
+        logger.warning(f"Unknown EKS resource type '{rtype}' — skipping {arn}")
+
+
+def delete_elasticache(session, arn: str):
+    """ElastiCache replication groups, cache clusters, and serverless caches."""
+    ec = session.client("elasticache")
+    parts = arn.split(":")
+    if len(parts) < 7:
+        logger.warning(f"Unexpected ElastiCache ARN — skipping {arn}")
+        return
+    rtype = parts[5]
+    rid = parts[6]
+
+    if rtype == "replicationgroup":
+        ec.delete_replication_group(ReplicationGroupId=rid, RetainPrimaryCluster=False)
+        logger.info(f"Deleted ElastiCache replication group: {rid}")
+
+    elif rtype == "cluster":
+        ec.delete_cache_cluster(CacheClusterId=rid)
+        logger.info(f"Deleted ElastiCache cluster: {rid}")
+
+    elif rtype == "serverlesscache":
+        ec.delete_serverless_cache(ServerlessCacheName=rid)
+        logger.info(f"Deleted ElastiCache Serverless cache: {rid}")
+
+    else:
+        logger.warning(f"Unknown ElastiCache resource type '{rtype}' — skipping {arn}")
+
+
+def delete_efs(session, arn: str):
+    """EFS file systems (storage + throughput $)."""
+    efs = session.client("efs")
+    fs_id = arn.split("/")[-1]
+    for mt in efs.describe_mount_targets(FileSystemId=fs_id).get("MountTargets", []):
+        efs.delete_mount_target(MountTargetId=mt["MountTargetId"])
+    if efs.describe_mount_targets(FileSystemId=fs_id).get("MountTargets"):
+        _wait_efs_mount_targets_gone(efs, fs_id)
+    efs.delete_file_system(FileSystemId=fs_id)
+    logger.info(f"Deleted EFS file system: {fs_id}")
+
+
+def delete_redshift(session, arn: str):
+    """Redshift provisioned clusters."""
+    rtype = resource_type_of(arn)
+    if rtype != "cluster":
+        logger.warning(f"Unknown Redshift resource type '{rtype}' — skipping {arn}")
+        return
+    name = arn.split("/")[-1]
+    session.client("redshift").delete_cluster(
+        ClusterIdentifier=name,
+        SkipFinalClusterSnapshot=True,
+    )
+    logger.info(f"Deleted Redshift cluster: {name}")
+
+
+def delete_redshift_serverless(session, arn: str):
+    """Redshift Serverless namespaces and workgroups."""
+    rs = session.client("redshift-serverless")
+    sec = ":".join(arn.split(":")[5:])
+    rtype = sec.split("/")[0]
+    name = sec.split("/", 1)[-1]
+
+    if rtype == "workgroup":
+        rs.delete_workgroup(workgroupName=name)
+        logger.info(f"Deleted Redshift Serverless workgroup: {name}")
+
+    elif rtype == "namespace":
+        rs.delete_namespace(namespaceName=name)
+        logger.info(f"Deleted Redshift Serverless namespace: {name}")
+
+    else:
+        logger.warning(f"Unknown Redshift Serverless resource type '{rtype}' — skipping {arn}")
+
+
+def delete_memorydb(session, arn: str):
+    """MemoryDB clusters."""
+    rtype = resource_type_of(arn)
+    if rtype != "cluster":
+        logger.warning(f"Unknown MemoryDB resource type '{rtype}' — skipping {arn}")
+        return
+    name = arn.split("/")[-1]
+    session.client("memorydb").delete_cluster(ClusterName=name)
+    logger.info(f"Deleted MemoryDB cluster: {name}")
+
+
+def delete_kafka(session, arn: str):
+    """Amazon MSK clusters."""
+    session.client("kafka").delete_cluster(ClusterArn=arn)
+    logger.info(f"Deleted MSK cluster: {arn}")
+
+
+def delete_kinesis(session, arn: str):
+    """Kinesis data streams."""
+    rtype = resource_type_of(arn)
+    if rtype != "stream":
+        logger.warning(f"Unknown Kinesis resource type '{rtype}' — skipping {arn}")
+        return
+    name = arn.split("/")[-1]
+    session.client("kinesis").delete_stream(StreamName=name, EnforceConsumerDeletion=True)
+    logger.info(f"Deleted Kinesis stream: {name}")
+
+
+def delete_firehose(session, arn: str):
+    """Kinesis Data Firehose delivery streams."""
+    rtype = resource_type_of(arn)
+    if rtype != "deliverystream":
+        logger.warning(f"Unknown Firehose resource type '{rtype}' — skipping {arn}")
+        return
+    name = arn.split("/")[-1]
+    session.client("firehose").delete_delivery_stream(
+        DeliveryStreamName=name,
+        AllowForceDelete=True,
+    )
+    logger.info(f"Deleted Firehose delivery stream: {name}")
+
+
+def delete_stepfunctions(session, arn: str):
+    """Step Functions state machines."""
+    session.client("stepfunctions").delete_state_machine(stateMachineArn=arn)
+    logger.info(f"Deleted Step Functions state machine: {arn}")
+
+
+def delete_events(session, arn: str):
+    """EventBridge rules (custom and default event bus)."""
+    events = session.client("events")
+    sec = ":".join(arn.split(":")[5:])
+    if not sec.startswith("rule/"):
+        logger.warning(f"Unexpected EventBridge ARN — skipping {arn}")
+        return
+    rest = sec[5:]  # after "rule/"
+    if "/" in rest:
+        bus_name, rule_name = rest.split("/", 1)
+    else:
+        bus_name, rule_name = "default", rest
+    tgt = events.list_targets_by_rule(Rule=rule_name, EventBusName=bus_name)
+    ids = [t["Id"] for t in tgt.get("Targets", [])]
+    if ids:
+        events.remove_targets(Rule=rule_name, EventBusName=bus_name, Ids=ids, Force=True)
+    events.delete_rule(Name=rule_name, EventBusName=bus_name)
+    logger.info(f"Deleted EventBridge rule: {rule_name} on {bus_name}")
+
+
+def delete_ecr(session, arn: str):
+    """ECR repositories (storage $)."""
+    if not arn.startswith("arn:aws:ecr:"):
+        logger.warning(f"Unexpected ECR ARN — skipping {arn}")
+        return
+    # arn:aws:ecr:region:account:repository/name/with/slashes  (no extra colons)
+    tail = arn.split(":", 5)[-1]
+    if not tail.startswith("repository/"):
+        logger.warning(f"Unknown ECR resource — skipping {arn}")
+        return
+    repo = tail[len("repository/") :]
+    session.client("ecr").delete_repository(repositoryName=repo, force=True)
+    logger.info(f"Deleted ECR repository: {repo}")
+
+
+def delete_secretsmanager(session, arn: str):
+    """Secrets Manager secrets (per-secret monthly $)."""
+    session.client("secretsmanager").delete_secret(SecretId=arn, ForceDeleteWithoutRecovery=True)
+    logger.info(f"Deleted secret: {arn}")
+
+
+def delete_glue(session, arn: str):
+    """Glue crawlers and jobs (glue DPU / crawler $)."""
+    glue = session.client("glue")
+    sec = ":".join(arn.split(":")[5:])
+    if "/" not in sec:
+        logger.warning(f"Unexpected Glue ARN — skipping {arn}")
+        return
+    rtype, name = sec.split("/", 1)
+
+    if rtype == "crawler":
+        glue.delete_crawler(Name=name)
+        logger.info(f"Deleted Glue crawler: {name}")
+
+    elif rtype == "job":
+        glue.delete_job(JobName=name)
+        logger.info(f"Deleted Glue job: {name}")
+
+    else:
+        logger.warning(f"Unknown Glue resource type '{rtype}' — skipping {arn}")
+
+
+def delete_emr(session, arn: str):
+    """EMR clusters (EC2-backed hourly $)."""
+    rtype = resource_type_of(arn)
+    if rtype != "cluster":
+        logger.warning(f"Unknown EMR resource type '{rtype}' — skipping {arn}")
+        return
+    job_flow_id = arn.split("/")[-1]
+    session.client("emr").terminate_job_flows(JobFlowIds=[job_flow_id])
+    logger.info(f"Terminated EMR cluster: {job_flow_id}")
+
+
+def delete_amplify(session, arn: str):
+    """Amplify apps (hosting build + serving $)."""
+    app_id = arn.split("/")[-1]
+    session.client("amplify").delete_app(appId=app_id)
+    logger.info(f"Deleted Amplify app: {app_id}")
+
+
+def delete_mq(session, arn: str):
+    """Amazon MQ brokers."""
+    parts = arn.split(":")
+    if len(parts) < 7 or parts[5] != "broker":
+        logger.warning(f"Unexpected MQ ARN — skipping {arn}")
+        return
+    broker_id = parts[6]
+    session.client("mq").delete_broker(BrokerId=broker_id)
+    logger.info(f"Deleted MQ broker: {broker_id}")
+
+
+def delete_dms(session, arn: str):
+    """DMS replication instances (instance hourly $)."""
+    parts = arn.split(":")
+    if len(parts) < 7 or parts[5] != "rep":
+        logger.warning(f"Unexpected DMS ARN (only replication instances supported) — skipping {arn}")
+        return
+    session.client("dms").delete_replication_instance(ReplicationInstanceArn=arn)
+    logger.info(f"Deleted DMS replication instance: {arn}")
+
+
+def delete_batch(session, arn: str):
+    """Batch compute environments."""
+    rtype = resource_type_of(arn)
+    if rtype != "compute-environment":
+        logger.warning(f"Unknown Batch resource type '{rtype}' — skipping {arn}")
+        return
+    name = arn.split("/")[-1]
+    b = session.client("batch")
+    b.update_compute_environment(computeEnvironment=name, state="DISABLED")
+    b.delete_compute_environment(computeEnvironment=name)
+    logger.info(f"Deleted Batch compute environment: {name}")
+
+
+def delete_apigateway_rest(session, arn: str):
+    """API Gateway REST APIs (v1)."""
+    rest_api_id = arn.rstrip("/").split("/")[-1]
+    session.client("apigateway").delete_rest_api(restApiId=rest_api_id)
+    logger.info(f"Deleted API Gateway REST API: {rest_api_id}")
+
+
+def delete_apigatewayv2(session, arn: str):
+    """API Gateway HTTP and WebSocket APIs (v2)."""
+    sec = arn.split(":")[5]
+    if not sec.startswith("api/"):
+        logger.warning(f"Unexpected API Gateway v2 ARN — skipping {arn}")
+        return
+    api_id = sec.split("/", 1)[1]
+    session.client("apigatewayv2").delete_api(ApiId=api_id)
+    logger.info(f"Deleted API Gateway v2 API: {api_id}")
+
+
+def delete_execute_api(session, arn: str):
+    """execute-api ARNs for HTTP APIs — delete via API Gateway v2."""
+    part = arn.split(":")[5]
+    api_id = part.split("/")[0]
+    session.client("apigatewayv2").delete_api(ApiId=api_id)
+    logger.info(f"Deleted API (execute-api ARN): {api_id}")
+
+
+def delete_appsync(session, arn: str):
+    """AppSync GraphQL APIs."""
+    sec = arn.split(":")[5]
+    if not sec.startswith("apis/"):
+        logger.warning(f"Unexpected AppSync ARN — skipping {arn}")
+        return
+    api_id = sec.split("/", 1)[1]
+    session.client("appsync").delete_graphql_api(apiId=api_id)
+    logger.info(f"Deleted AppSync API: {api_id}")
+
+
+def delete_logs(session, arn: str):
+    """CloudWatch Logs log groups (ingestion + storage $)."""
+    parts = arn.split(":")
+    if len(parts) < 7 or parts[5] != "log-group":
+        logger.warning(f"Unexpected Logs ARN — skipping {arn}")
+        return
+    name = ":".join(parts[6:]).removesuffix(":*")
+    session.client("logs").delete_log_group(logGroupName=name)
+    logger.info(f"Deleted log group: {name}")
+
+
+def delete_docdb_elastic(session, arn: str):
+    """Amazon DocumentDB elastic clusters."""
+    session.client("docdb-elastic").delete_cluster(clusterArn=arn)
+    logger.info(f"Deleted DocumentDB Elastic cluster: {arn}")
+
+
+def delete_timestream(session, arn: str):
+    """
+    Amazon Timestream — single table or whole database.
+
+    Table ARN:  arn:aws:timestream:region:account:database/dbname/table/tablename
+    Database:   arn:aws:timestream:region:account:database/dbname
+    """
+    tw = session.client("timestream-write")
+    sec = ":".join(arn.split(":")[5:])
+    if not sec.startswith("database/"):
+        logger.warning(f"Unknown Timestream resource — skipping {arn}")
+        return
+
+    if "/table/" in sec:
+        head, _, table_name = sec.partition("/table/")
+        db_name = head[len("database/") :]
+        if not db_name or not table_name:
+            logger.warning(f"Malformed Timestream table ARN — skipping {arn}")
+            return
+        tw.delete_table(DatabaseName=db_name, TableName=table_name)
+        logger.info(f"Deleted Timestream table: {table_name} (database {db_name})")
+        return
+
+    db_name = sec[len("database/") :]
+    paginator = tw.get_paginator("list_tables")
+    for page in paginator.paginate(DatabaseName=db_name):
+        for t in page.get("Tables", []):
+            tw.delete_table(DatabaseName=db_name, TableName=t["TableName"])
+    tw.delete_database(DatabaseName=db_name)
+    logger.info(f"Deleted Timestream database: {db_name}")
+
+
+def delete_globalaccelerator(session, arn: str):
+    """
+    Global Accelerator (fixed fee + data processing $).
+    API is only available in us-west-2, us-east-1, us-east-2, eu-west-1, etc.
+    """
+    # ARN has no region segment; boto3 needs a regional endpoint for this control plane.
+    ga = boto3.Session(region_name="us-west-2").client("globalaccelerator")
+    ga.delete_accelerator(AcceleratorArn=arn)
+    logger.info(f"Deleted Global Accelerator: {arn}")
+
+
+def sort_arns_for_deletion(arns: list[str]) -> list[str]:
+    """
+    Order deletes so dependents go before parents (RDS proxies before instances they
+    target, instances before clusters, EKS nodegroups/Fargate before cluster,
+    ECS services before cluster, EC2 NAT gateways before their Elastic IPs, etc.).
+    """
+    def key(a: str) -> tuple:
+        svc = service_of(a)
+        r = resource_type_of(a)
+        if svc == "rds":
+            # Proxy must go before db — proxy targets instances; delete proxy first.
+            order = {
+                "db-proxy": 0,
+                "db": 1,
+                "snapshot": 2,
+                "cluster-snapshot": 3,
+                "cluster": 4,
+            }
+            return (0, order.get(r, 99), a)
+        if svc == "eks":
+            order = {"nodegroup": 0, "fargateprofile": 1, "cluster": 2}
+            return (1, order.get(r, 99), a)
+        if svc == "ecs":
+            order = {"service": 0, "cluster": 1}
+            return (2, order.get(r, 99), a)
+        if svc == "redshift-serverless":
+            sec = ":".join(a.split(":")[5:])
+            rt = sec.split("/")[0]
+            order = {"workgroup": 0, "namespace": 1}
+            return (3, order.get(rt, 99), a)
+        if svc == "ec2":
+            # NAT gateways hold an allocation — release NAT before the EIP.
+            order = {
+                "natgateway": 0,
+                "internet-gateway": 1,
+                "elastic-ip": 2,
+                "vpc-endpoint": 3,
+            }
+            return (4, order.get(r, 50), a)
+        return (9, 0, a)
+
+    return sorted(arns, key=key)
+
+
 HANDLERS = {
     "ec2":                   delete_ec2,
     "rds":                   delete_rds,
@@ -627,18 +1111,47 @@ HANDLERS = {
     "bedrock":               delete_bedrock,
     "apprunner":             delete_apprunner,
     "sagemaker":             delete_sagemaker,
-    "es":                    delete_opensearch,       # managed domains (ARN prefix 'es')
-    "aoss":                  delete_opensearch,       # serverless collections
+    "es":                    delete_opensearch,
+    "aoss":                  delete_opensearch,
     "osis":                  delete_opensearch_ingestion,
+    "eks":                   delete_eks,
+    "elasticache":           delete_elasticache,
+    "elasticfilesystem":     delete_efs,
+    "redshift":              delete_redshift,
+    "redshift-serverless":   delete_redshift_serverless,
+    "memorydb":              delete_memorydb,
+    "kafka":                 delete_kafka,
+    "kinesis":               delete_kinesis,
+    "firehose":              delete_firehose,
+    "states":                delete_stepfunctions,
+    "events":                delete_events,
+    "ecr":                   delete_ecr,
+    "secretsmanager":        delete_secretsmanager,
+    "glue":                  delete_glue,
+    "elasticmapreduce":      delete_emr,
+    "amplify":               delete_amplify,
+    "mq":                    delete_mq,
+    "dms":                   delete_dms,
+    "batch":                 delete_batch,
+    "apigateway":            delete_apigateway_rest,
+    "apigatewayv2":          delete_apigatewayv2,
+    "execute-api":           delete_execute_api,
+    "appsync":               delete_appsync,
+    "logs":                  delete_logs,
+    "docdb-elastic":         delete_docdb_elastic,
+    "timestream":            delete_timestream,
+    "globalaccelerator":     delete_globalaccelerator,
 }
 
 
 def dispatch(session, arn: str):
+    r = region_of(arn)
+    regional = boto3.Session(region_name=r) if r else session
     service = service_of(arn)
     handler = HANDLERS.get(service)
     if handler:
         try:
-            handler(session, arn)
+            handler(regional, arn)
         except ClientError as e:
             logger.error(f"Failed to delete {arn}: {e.response['Error']['Message']}")
     else:
@@ -651,7 +1164,7 @@ def handler(event, context):
     session = boto3.Session()
     logger.info("Starting nightly cleanup — finding resources tagged auto-delete=true")
 
-    arns = get_all_tagged_resources(session)
+    arns = sort_arns_for_deletion(get_all_tagged_resources(session))
     logger.info(f"Found {len(arns)} resource(s) to delete")
 
     deleted, failed = 0, 0

@@ -49,6 +49,7 @@ data "aws_iam_policy_document" "cleanup_permissions" {
     sid    = "EC2Cleanup"
     effect = "Allow"
     actions = [
+      "ec2:DescribeRegions",
       "ec2:DescribeInstances",
       "ec2:TerminateInstances",
       "ec2:DeleteVolume",
@@ -56,6 +57,14 @@ data "aws_iam_policy_document" "cleanup_permissions" {
       "ec2:DeregisterImage",
       "ec2:DeleteSecurityGroup",
       "ec2:DeleteKeyPair",
+      "ec2:DeleteNatGateway",
+      "ec2:DescribeInternetGateways",
+      "ec2:DetachInternetGateway",
+      "ec2:DeleteInternetGateway",
+      "ec2:DescribeAddresses",
+      "ec2:DisassociateAddress",
+      "ec2:ReleaseAddress",
+      "ec2:DeleteVpcEndpoints",
     ]
     resources = ["*"]
   }
@@ -73,6 +82,7 @@ data "aws_iam_policy_document" "cleanup_permissions" {
       "rds:DeleteDBClusterSnapshot",
       "rds:DescribeDBSnapshots",
       "rds:DescribeDBClusterSnapshots",
+      "rds:DeleteDBProxy",
     ]
     resources = ["*"]
   }
@@ -125,6 +135,22 @@ data "aws_iam_policy_document" "cleanup_permissions" {
       "sagemaker:DescribeDomain",
       "sagemaker:ListUserProfiles",
       "sagemaker:ListApps",
+    ]
+    resources = ["*"]
+  }
+
+  # SageMaker ML Lineage Tracking — auto-created alongside endpoint deployments
+  # context, action, artifact and association are created automatically when
+  # endpoints are deployed and inherit the endpoint's tags
+  statement {
+    sid    = "SageMakerLineageCleanup"
+    effect = "Allow"
+    actions = [
+      "sagemaker:DeleteContext",
+      "sagemaker:DeleteAction",
+      "sagemaker:DeleteArtifact",
+      "sagemaker:DeleteAssociation",
+      "sagemaker:ListAssociations",
     ]
     resources = ["*"]
   }
@@ -257,6 +283,228 @@ data "aws_iam_policy_document" "cleanup_permissions" {
       "osis:DeletePipeline",
       "osis:GetPipeline",
     ]
+    resources = ["*"]
+  }
+
+  # EKS — control plane + managed node groups + Fargate
+  statement {
+    sid    = "EKSCleanup"
+    effect = "Allow"
+    actions = [
+      "eks:DeleteCluster",
+      "eks:ListNodegroups",
+      "eks:DeleteNodegroup",
+      "eks:ListFargateProfiles",
+      "eks:DeleteFargateProfile",
+    ]
+    resources = ["*"]
+  }
+
+  # ElastiCache — replication groups, clusters, serverless
+  statement {
+    sid    = "ElastiCacheCleanup"
+    effect = "Allow"
+    actions = [
+      "elasticache:DeleteReplicationGroup",
+      "elasticache:DeleteCacheCluster",
+      "elasticache:DeleteServerlessCache",
+    ]
+    resources = ["*"]
+  }
+
+  # EFS
+  statement {
+    sid    = "EFSCleanup"
+    effect = "Allow"
+    actions = [
+      "elasticfilesystem:DescribeMountTargets",
+      "elasticfilesystem:DeleteMountTarget",
+      "elasticfilesystem:DeleteFileSystem",
+    ]
+    resources = ["*"]
+  }
+
+  # Redshift provisioned + Serverless
+  statement {
+    sid    = "RedshiftCleanup"
+    effect = "Allow"
+    actions = [
+      "redshift:DeleteCluster",
+      "redshift-serverless:DeleteWorkgroup",
+      "redshift-serverless:DeleteNamespace",
+    ]
+    resources = ["*"]
+  }
+
+  # MemoryDB
+  statement {
+    sid    = "MemoryDBCleanup"
+    effect = "Allow"
+    actions = ["memorydb:DeleteCluster"]
+    resources = ["*"]
+  }
+
+  # MSK
+  statement {
+    sid    = "MSKCleanup"
+    effect = "Allow"
+    actions = ["kafka:DeleteCluster"]
+    resources = ["*"]
+  }
+
+  # Kinesis Data Streams + Firehose
+  statement {
+    sid    = "KinesisCleanup"
+    effect = "Allow"
+    actions = [
+      "kinesis:DeleteStream",
+      "firehose:DeleteDeliveryStream",
+    ]
+    resources = ["*"]
+  }
+
+  # Step Functions
+  statement {
+    sid    = "StepFunctionsCleanup"
+    effect = "Allow"
+    actions = ["states:DeleteStateMachine"]
+    resources = ["*"]
+  }
+
+  # EventBridge rules
+  statement {
+    sid    = "EventBridgeCleanup"
+    effect = "Allow"
+    actions = [
+      "events:ListTargetsByRule",
+      "events:RemoveTargets",
+      "events:DeleteRule",
+    ]
+    resources = ["*"]
+  }
+
+  # ECR
+  statement {
+    sid    = "ECRCleanup"
+    effect = "Allow"
+    actions = ["ecr:DeleteRepository"]
+    resources = ["*"]
+  }
+
+  # Secrets Manager
+  statement {
+    sid    = "SecretsManagerCleanup"
+    effect = "Allow"
+    actions = ["secretsmanager:DeleteSecret"]
+    resources = ["*"]
+  }
+
+  # Glue crawlers + jobs
+  statement {
+    sid    = "GlueCleanup"
+    effect = "Allow"
+    actions = [
+      "glue:DeleteCrawler",
+      "glue:DeleteJob",
+    ]
+    resources = ["*"]
+  }
+
+  # EMR
+  statement {
+    sid    = "EMRCleanup"
+    effect = "Allow"
+    actions = ["elasticmapreduce:TerminateJobFlows"]
+    resources = ["*"]
+  }
+
+  # Amplify
+  statement {
+    sid    = "AmplifyCleanup"
+    effect = "Allow"
+    actions = ["amplify:DeleteApp"]
+    resources = ["*"]
+  }
+
+  # Amazon MQ
+  statement {
+    sid    = "MQCleanup"
+    effect = "Allow"
+    actions = ["mq:DeleteBroker"]
+    resources = ["*"]
+  }
+
+  # DMS replication instances
+  statement {
+    sid    = "DMSCleanup"
+    effect = "Allow"
+    actions = ["dms:DeleteReplicationInstance"]
+    resources = ["*"]
+  }
+
+  # Batch compute environments
+  statement {
+    sid    = "BatchCleanup"
+    effect = "Allow"
+    actions = [
+      "batch:UpdateComputeEnvironment",
+      "batch:DeleteComputeEnvironment",
+    ]
+    resources = ["*"]
+  }
+
+  # API Gateway REST (v1) + HTTP/WebSocket (v2)
+  statement {
+    sid    = "APIGatewayCleanup"
+    effect = "Allow"
+    actions = [
+      "apigateway:DeleteRestApi",
+      "apigatewayv2:DeleteApi",
+    ]
+    resources = ["*"]
+  }
+
+  # AppSync
+  statement {
+    sid    = "AppSyncCleanup"
+    effect = "Allow"
+    actions = ["appsync:DeleteGraphqlApi"]
+    resources = ["*"]
+  }
+
+  # CloudWatch Logs
+  statement {
+    sid    = "CloudWatchLogsCleanup"
+    effect = "Allow"
+    actions = ["logs:DeleteLogGroup"]
+    resources = ["*"]
+  }
+
+  # DocumentDB Elastic
+  statement {
+    sid    = "DocDBElasticCleanup"
+    effect = "Allow"
+    actions = ["docdb-elastic:DeleteCluster"]
+    resources = ["*"]
+  }
+
+  # Timestream
+  statement {
+    sid    = "TimestreamCleanup"
+    effect = "Allow"
+    actions = [
+      "timestream:ListTables",
+      "timestream:DeleteTable",
+      "timestream:DeleteDatabase",
+    ]
+    resources = ["*"]
+  }
+
+  # Global Accelerator (control-plane API)
+  statement {
+    sid    = "GlobalAcceleratorCleanup"
+    effect = "Allow"
+    actions = ["globalaccelerator:DeleteAccelerator"]
     resources = ["*"]
   }
 
